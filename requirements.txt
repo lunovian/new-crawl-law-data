@@ -1,3 +1,6 @@
 pytest-playwright
 openpyxl
 pandas
+tqdm
+beautifulsoup4
+aiohttp

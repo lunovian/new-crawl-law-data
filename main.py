@@ -1,144 +1,83 @@
 import os
-import pandas as pd
-from playwright.sync_api import sync_playwright
+import asyncio
+from playwright.sync_api import sync_playwright  # type: ignore
+from utils.download import process_excel_file, process_url
+from utils.login import google_login, get_credentials, save_cookies, load_cookies
+from utils.parallel import BrowserManager
+from utils.url_collector import UrlCollector
+from utils.progress import ProgressTracker
 
-# Path to the "links" folder
-links_folder = "./links"
+# Path to the "batches" folder
+links_folder = "./batches"
 
 # Initialize a list to store all URLs
-all_urls = []
+saved_urls = []
 
-# Google account credentials
-google_email = r"email"
-google_password = r"password"
-
-
-# Function to process an Excel file
-def process_excel_file(file_path):
-    try:
-        # Read the Excel file into a DataFrame
-        df = pd.read_excel(file_path)
-
-        # Check if the required columns exist
-        if "Url" not in df.columns:
-            print(f"File {file_path} does not contain the 'Url' column.")
-            return
-
-        # Extract the 'Url' column and add it to the global list
-        urls = df["Url"].dropna().tolist()  # Drop any NaN values
-        all_urls.extend(urls)
-
-        print(f"Processed {file_path}. Found {len(urls)} URLs.")
-
-    except Exception as e:
-        print(f"Error processing {file_path}: {e}")
-
-
-# Function to log in with Google using XPath selectors
-def google_login(page):
-    try:
-        # Navigate to the login page
-        page.goto("https://luatvietnam.vn/")  # Replace with the actual login URL
-
-        # Click the "Login" button using the provided XPath
-        page.click(
-            '//span[contains(text(),"/ Đăng nhập")]'
-        )  # XPath for the Login button
-
-        # Wait for the Google login button to appear and click it
-        page.wait_for_selector(
-            '//form[@id="form0"]//a[@class="login-google social-cr google-login"]',
-            timeout=20000,
-        )
-        page.click(
-            '//form[@id="form0"]//a[@class="login-google social-cr google-login"]'
-        )  # XPath for Google login button
-
-        # Handle the popup (Google login page)
-        with page.expect_popup() as popup_info:
-            pass  # Popup is already opened by the previous click
-
-        popup = popup_info.value
-        popup.wait_for_load_state()
-
-        # Interact with the Google login page
-        popup.wait_for_selector(
-            '//input[@id="identifierId"]', timeout=20000
-        )  # Wait for the email input field
-        popup.fill('//input[@id="identifierId"]', google_email)
-        popup.press('//input[@id="identifierId"]', "Enter")
-
-        popup.wait_for_selector(
-            '//input[@name="Passwd"]', timeout=20000
-        )  # Wait for the password input field
-        popup.fill('//input[@name="Passwd"]', google_password)
-        popup.press('//input[@name="Passwd"]', "Enter")
-
-        # Wait for navigation to complete after login
-        page.wait_for_selector(
-            "a.dashboard-link", timeout=30000
-        )  # Replace with a selector that confirms login success
-
-        print("Google login successful!")
-
-    except Exception as e:
-        print(f"Google login failed: {e}")
-        page.screenshot(path="debug.png")  # Take a screenshot for debugging
-        exit()
-
-
-# Function to process each URL after login
-def process_url(page, url):
-    try:
-        # Navigate to the URL
-        page.goto(url)
-
-        # Perform actions on the page (e.g., scrape data, download files)
-        # Example: Extract the page title
-        title = page.title()
-        print(f"URL: {url} | Title: {title}")
-
-    except Exception as e:
-        print(f"Error processing URL {url}: {e}")
+# Get Google account credentials
+google_email, google_password = get_credentials()
 
 
 # Main function to process all Excel files in the folder
-def process_links_folder():
+def process_links_folder(links_folder):
     # Loop through all files in the "links" folder
     for file_name in os.listdir(links_folder):
         # Check if the file matches the pattern Batch_[number].xlsx
         if file_name.startswith("Batch_") and file_name.endswith(".xlsx"):
             file_path = os.path.join(links_folder, file_name)
-            process_excel_file(file_path)
+            process_excel_file(file_path, saved_urls=saved_urls)
 
 
-# Run the script
-with sync_playwright() as p:
-    # Launch the browser
-    browser = p.chromium.launch(
-        headless=False,
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=IsolateOrigins,site-per-process",
-            "--disable-site-isolation-trials",
-        ],
-    )
-    context = browser.new_context()
-    page = context.new_page()
+async def main():
+    url_collector = UrlCollector()
+    progress_tracker = ProgressTracker()
+
+    # Process Excel files and get unprocessed URLs
+    process_links_folder(links_folder)
+    all_urls = progress_tracker.filter_unprocessed_urls(saved_urls)
+
+    # Filter out already processed URLs
+    unprocessed_urls = url_collector.get_unprocessed_urls(all_urls)
+
+    if not unprocessed_urls:
+        print("No new URLs to process!")
+        return
+
+    print(f"\nFound {len(unprocessed_urls)} unprocessed URLs")
+    print(f"Skipping {len(all_urls) - len(unprocessed_urls)} already processed URLs")
+
+    # Initialize single browser
+    browser_manager = BrowserManager(google_email, google_password, headless=False)
+    page = await browser_manager.initialize()
 
     try:
-        # Log in with Google
-        google_login(page)
+        # Process URLs sequentially
+        print("\nCollecting download URLs...")
+        url_collector.init_progress_bar(len(unprocessed_urls))
 
-        # Process all Excel files and collect URLs
-        process_links_folder()
+        for url in unprocessed_urls:
+            await url_collector.collect_urls(page, url)
+        url_collector.close()
 
-        # Process each collected URL
-        for url in all_urls:
-            process_url(page, url)
+        # Process downloads
+        downloads = url_collector.load_pending_downloads()
+        if downloads:
+            print(f"\nDownloading {len(downloads)} files...")
+            progress_tracker.init_progress_bar(len(downloads))
+
+            for download in downloads:
+                await url_collector.process_url(
+                    page=page,
+                    url=download["url"],
+                    file_type=download["type"],
+                    progress_tracker=progress_tracker,
+                )
+            progress_tracker.close()
+        else:
+            print("\nNo download URLs found!")
 
     finally:
-        # Close the browser
-        browser.close()
+        await browser_manager.close()
 
-print("\nAll URLs processed.")
+
+if __name__ == "__main__":
+    asyncio.run(main())

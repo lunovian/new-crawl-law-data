@@ -1,1 +1,13 @@
 *.xlsx
+auth_cookies.json
+credentials.json
+*.pyc
+download_status.csv
+*.docx
+*.pdf
+*.png
+progress.csv
+progress.csv.backup
+collection_progress.json
+*.log
+download_urls.csv
