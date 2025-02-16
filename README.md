@@ -43,8 +43,16 @@ playwright install
 
 ## Usage
 
-1. Add Excel files containing URLs to the `batches` folder
-2. Run the crawler:
+1. Add Excel files containing URLs to the `batches` folder.
+2. **First-time setup:** Run the crawler in visible mode to complete Google login.
+
+```bash
+python main.py --no-headless
+```
+
+   - This step is **mandatory** for the first run to authenticate and save login cookies.
+
+3. After logging in successfully, run the crawler normally:
 
 ```bash
 python main.py
@@ -100,3 +108,4 @@ Common issues:
 - **Permission errors**: Check folder permissions
 
 ## Contact
+
