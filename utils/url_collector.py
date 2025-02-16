@@ -6,9 +6,10 @@ import re
 from playwright.async_api import Error as PlaywrightError, TimeoutError
 from playwright.sync_api import sync_playwright  # type: ignore
 from utils.batch_processor import BatchProcessor
-from utils.download import download_file
+from utils.download import DownloadManager
 from utils.progress import ProgressTracker
-from utils.download import process_downloads
+from utils.signal_handler import ExitHandler
+from utils.download import DownloadManager
 from utils.rename_file import rename_downloaded_file
 import logging
 from utils.login import (
@@ -22,7 +23,7 @@ import math
 
 
 # URL collection threads (more conservative)
-url_threads = min(cpu_count() - 1, 4)  # Cap at 4
+url_threads = min(cpu_count() - 1, 8)  # Cap at 4
 url_threads = max(2, url_threads)  # Minimum 2
 
 # Path to the "batches" folder
@@ -41,7 +42,11 @@ class UrlCollector:
         self._init_file()
         self.timeout = 30000
         self.max_retries = 3
+        self.progress_threshold = 100
+        self.processed_count = 0
+        self.download_manager = DownloadManager()
         self.progress_tracker = ProgressTracker()
+        self.exit_handler = ExitHandler()
 
     def _init_file(self):
         """Initialize download_urls.csv if it doesn't exist"""
@@ -63,81 +68,132 @@ class UrlCollector:
         """Update progress with threshold-based printing"""
         self.processed_count += 1
         if self.processed_count % self.progress_threshold == 0:
-            print(f"\nProcessed {self.processed_count} URLs")
-            print(f"Last URL: {url}")
-            print(f"Status: {status}")
+            logging.info(f"[✓] Processed {self.processed_count} URLs")
+            logging.info(f"[📥] Last URL: {url}")
+            logging.info(f"[📥] Status: {status}")
 
     def collect_urls(self, page, url):
-        """Collect document and PDF URLs from a page
-
-        Returns:
-            tuple: (doc_url, pdf_url) - Both empty strings if not found
-        """
+        """Collect document and PDF URLs from a page"""
         processed_urls = self.get_processed_urls()
-
         if url in processed_urls:
             self.progress_tracker.update_progress(url, "SKIPPED")
             return "", ""
 
         for attempt in range(self.max_retries):
             try:
+                # Set timeouts
+                page.set_default_timeout(60000)
+                page.set_default_navigation_timeout(60000)
+
                 # Block unwanted resources
                 page.route(
                     "**/*.{png,jpg,jpeg,gif,css,woff,woff2}",
                     lambda route: route.abort(),
                 )
 
-                # Navigate with timeout
-                page.goto(url, wait_until="domcontentloaded", timeout=self.timeout)
+                try:
+                    # Navigate with better error handling
+                    logging.info(f"[🌐] Attempt {attempt + 1}: Loading {url}")
+                    response = page.goto(
+                        url,
+                        wait_until="domcontentloaded",  # Changed from networkidle
+                        timeout=120000,
+                    )
 
-                # Get page content
-                html_content = page.content()
-                soup = BeautifulSoup(html_content, "html.parser")
+                    if not response:
+                        raise Exception("No response received")
 
-                # Find links
-                static_links = {"doc": "", "pdf": ""}
-                for link in soup.find_all(
-                    "a", href=re.compile(r"static\.luatvietnam\.vn")
-                ):
-                    href = link["href"].lower()
-                    if href.endswith(".pdf"):
-                        static_links["pdf"] = href
-                    elif any(href.endswith(ext) for ext in [".doc", ".docx"]):
-                        static_links["doc"] = href
-                    if static_links["doc"] and static_links["pdf"]:
-                        break
+                    if not response.ok:
+                        raise Exception(
+                            f"HTTP {response.status}: {response.status_text}"
+                        )
 
-                # Save results
-                self.save_urls(
-                    page_url=url,
-                    doc_url=static_links["doc"],
-                    pdf_url=static_links["pdf"],
-                    url_status="FOUND"
-                    if (static_links["doc"] or static_links["pdf"])
-                    else "ERROR",  # Changed 'status' to 'url_status'
-                    download_status="NOT_STARTED",
-                )
+                    # Wait for network to be idle after load
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=30000)
+                    except TimeoutError:
+                        logging.warning(
+                            f"[⚠] Network idle timeout on {url}, continuing anyway"
+                        )
 
-                # Update progress with results
-                status = (
-                    "FOUND"
-                    if (static_links["doc"] or static_links["pdf"])
-                    else "FAILED"
-                )
-                self.progress_tracker.update_progress(
-                    url=url,
-                    status=status,
-                    doc_url=static_links["doc"],
-                    pdf_url=static_links["pdf"],
-                )
+                    # Get page content and parse
+                    html_content = page.content()
+                    if not html_content:
+                        raise Exception("Empty page content")
 
-                return static_links["doc"], static_links["pdf"]
+                    soup = BeautifulSoup(html_content, "html.parser")
+
+                    # Find links with better logging
+                    static_links = {"doc": "", "pdf": ""}
+                    found_links = soup.find_all(
+                        "a", href=re.compile(r"static\.luatvietnam\.vn")
+                    )
+
+                    if not found_links:
+                        logging.warning(f"[⚠] No static links found on {url}")
+
+                    for link in found_links:
+                        href = link["href"].lower()
+                        if href.endswith(".pdf"):
+                            static_links["pdf"] = href
+                            logging.debug(f"[📄] Found PDF: {href}")
+                        elif any(href.endswith(ext) for ext in [".doc", ".docx"]):
+                            static_links["doc"] = href
+                            logging.debug(f"[📄] Found DOC: {href}")
+                        if static_links["doc"] and static_links["pdf"]:
+                            break
+
+                    # Save results with explicit status
+                    url_status = (
+                        "FOUND"
+                        if (static_links["doc"] or static_links["pdf"])
+                        else "FAILED"
+                    )
+                    logging.info(
+                        f"[{'✓' if url_status == 'FOUND' else '✗'}] {url}: {url_status}"
+                    )
+
+                    self.save_urls(
+                        page_url=url,
+                        doc_url=static_links["doc"],
+                        pdf_url=static_links["pdf"],
+                        url_status=url_status,
+                        download_status="NOT_STARTED",
+                    )
+
+                    self.progress_tracker.update_progress(
+                        url=url,
+                        status=url_status,
+                        doc_url=static_links["doc"],
+                        pdf_url=static_links["pdf"],
+                    )
+                    self._update_progress(url, url_status)
+                    return static_links["doc"], static_links["pdf"]
+
+                except TimeoutError as te:
+                    logging.error(
+                        f"[✗] Timeout on attempt {attempt + 1} for {url}: {str(te)}"
+                    )
+                    if attempt == self.max_retries - 1:
+                        self.save_urls(page_url=url, url_status="FAILED")
+                    continue
+
+                except Exception as e:
+                    logging.error(
+                        f"[✗] Error on attempt {attempt + 1} for {url}: {str(e)}"
+                    )
+                    if attempt == self.max_retries - 1:
+                        self.save_urls(page_url=url, url_status="FAILED")
+                    continue
 
             except Exception as e:
-                logging.error(f"Error for {url}: {str(e)}")
+                logging.error(
+                    f"[✗] Fatal error on attempt {attempt + 1} for {url}: {str(e)}"
+                )
                 if attempt == self.max_retries - 1:
-                    self.progress_tracker.update_progress(url, "FAILED")
-                return "", ""
+                    self.save_urls(page_url=url, url_status="FAILED")
+
+        return "", ""
 
     def save_urls(
         self,
@@ -243,14 +299,14 @@ class UrlCollector:
                                     collector.add_downloads(downloads)
                                     success = True
                                 except Exception as e:
-                                    print(f"✗ Failed: {e}")
+                                    logging.error(f"✗ Failed: {e}")
 
                             # Store result regardless of success
                             results.append((url, doc_url, pdf_url))
                             break
 
                         except Exception as e:
-                            print(
+                            logging.error(
                                 f"Attempt {retry_count + 1} failed for URL {url}: {e}"
                             )
                             retry_count += 1
@@ -262,8 +318,8 @@ class UrlCollector:
 
             finally:
                 browser.close()
-                print(
-                    f"\nBatch processing completed. Total URLs processed: {self.processed_count}"
+                logging.info(
+                    f"Batch processing completed. Total URLs processed: {self.processed_count}"
                 )
 
     def load_pending_downloads(self):
@@ -292,69 +348,32 @@ class UrlCollector:
                             )
         return downloads
 
-    def process_url(self, page, url, file_type, progress_tracker):
-        """Process URL download with specific error handling"""
-        try:
-            print(f"\nProcessing {file_type.upper()} URL: {url}")
-            page.goto(url, wait_until="domcontentloaded")
-
-            # Get cookies for download
-            cookies = {
-                cookie["name"]: cookie["value"] for cookie in page.context.cookies()
-            }
-
-            # Download file
-            downloads_dir = "./downloads"
-            type_dir = os.path.join(downloads_dir, file_type)
-            os.makedirs(type_dir, exist_ok=True)
-
-            new_filename = rename_downloaded_file("", url, file_type)
-            filepath = os.path.join(type_dir, new_filename)
-
-            if download_file(url, filepath, cookies):
-                print(f"Successfully downloaded: {new_filename}")
-                progress_tracker.update_progress(
-                    url=url, status="SUCCESS", file_types=[file_type], static_urls=[url]
-                )
-            else:
-                raise IOError("Download failed")
-
-        except PlaywrightError as e:
-            logging.error(f"Browser error downloading {url}: {str(e)}")
-            progress_tracker.update_progress(
-                url, "ERROR", None, f"Browser error: {str(e)}"
-            )
-        except TimeoutError as e:
-            logging.error(f"Timeout downloading {url}: {str(e)}")
-            progress_tracker.update_progress(url, "ERROR", None, f"Timeout: {str(e)}")
-        except IOError as e:
-            logging.error(f"IO error downloading {url}: {str(e)}")
-            progress_tracker.update_progress(url, "ERROR", None, f"IO error: {str(e)}")
-        except Exception as e:
-            logging.error(f"Unexpected error downloading {url}: {str(e)}")
-            progress_tracker.update_progress(
-                url, "ERROR", None, f"Unexpected error: {str(e)}"
-            )
-
     def process_url_collection(
         self, batch_processor, safe_collector, headless, progress_tracker
     ):
         """Process URL collection and new downloads"""
         try:
+            # Register components with exit handler
+            self.exit_handler.progress_tracker = progress_tracker
+            self.exit_handler.url_collector = self
+            self.exit_handler.register_components(
+                download_manager=self.download_manager
+            )
+
             # Process Excel files and get unprocessed URLs
             saved_urls = batch_processor.process_folder("batches")
             if not saved_urls:
-                print("No URLs found in batch files!")
+                logging.info("No URLs found in batch files!")
                 return
 
             unprocessed_urls = progress_tracker.filter_unprocessed_urls(saved_urls)
             if not unprocessed_urls:
-                print("No new URLs to process!")
+                logging.info("No new URLs to process!")
                 return
 
             # Set total URLs for progress tracking
             progress_tracker.set_total_urls(len(unprocessed_urls))
-            print(f"\nProcessing {len(unprocessed_urls)} URLs...")
+            logging.info(f"Processing {len(unprocessed_urls)} URLs...")
 
             # Calculate batch size and create batches
             try:
@@ -364,13 +383,13 @@ class UrlCollector:
                     for i in range(0, len(unprocessed_urls), batch_size)
                 ]
             except Exception as e:
-                print(f"Error creating URL batches: {e}")
+                logging.error(f"Error creating URL batches: {e}")
                 return
 
             # Print thread and batch information
-            print(f"\nSystem CPU count: {cpu_count()}")
-            print(f"Using {url_threads} threads")
-            print(f"Batch size: {batch_size} URLs per thread")
+            logging.info(f"System CPU count: {cpu_count()}")
+            logging.info(f"Using {url_threads} threads")
+            logging.info(f"Batch size: {batch_size} URLs per thread")
 
             # Prepare arguments for each thread - remove headless from args
             thread_args = [
@@ -384,15 +403,20 @@ class UrlCollector:
                 for batch in url_batches
             ]
 
-            print("\nStarting URL collection...")
+            logging.info("Starting URL collection...")
             # Process URL batches in parallel using threads
             with ThreadPoolExecutor(max_workers=url_threads) as executor:
+                self.exit_handler.register_executor(executor)
                 futures = []
                 thread_map = {}  # Store batch URLs for error handling
 
                 try:
                     # Update thread submission to include headless
                     for thread_arg in thread_args:
+                        if self.exit_handler.exit_requested:
+                            logging.info("[⚠] Exit requested, stopping new submissions")
+                            break
+
                         try:
                             urls, email, password, url_collector, is_headless = (
                                 thread_arg
@@ -408,11 +432,17 @@ class UrlCollector:
                             thread_map[future] = urls
                             futures.append(future)
                         except Exception as e:
-                            print(f"Error submitting batch to thread pool: {e}")
+                            logging.error(f"Error submitting batch to thread pool: {e}")
                             continue
 
                     # Process results as they complete
                     for future in futures:
+                        if self.exit_handler.exit_requested:
+                            logging.info(
+                                "[⚠] Exit requested, processing remaining results"
+                            )
+                            break
+
                         try:
                             result = future.result(
                                 timeout=300
@@ -434,13 +464,13 @@ class UrlCollector:
                                             )
                                         progress_tracker.update_progress()
                                     except Exception as e:
-                                        print(
+                                        logging.error(
                                             f"Error updating progress for URL {url}: {e}"
                                         )
                                         continue
 
                         except TimeoutError:
-                            print("Batch processing timed out")
+                            logging.error("[✗] Batch processing timed out")
                             failed_urls = thread_map[future]
                             for failed_url in failed_urls:
                                 progress_tracker.update_url_status(
@@ -448,7 +478,7 @@ class UrlCollector:
                                     status=progress_tracker.URL_STATUS_FAILED,
                                 )
                         except Exception as e:
-                            print(f"Error processing batch: {e}")
+                            logging.error(f"[✗] Error processing batch: {e}")
                             failed_urls = thread_map[future]
                             for failed_url in failed_urls:
                                 progress_tracker.update_url_status(
@@ -457,20 +487,26 @@ class UrlCollector:
                                 )
 
                 finally:
-                    progress_tracker.close()
+                    if not self.exit_handler.exit_requested:
+                        progress_tracker.close()
 
-            # Process pending downloads
+            # Update download processing section
             try:
                 pending_downloads = progress_tracker.get_pending_downloads()
                 if not pending_downloads.empty:
-                    print(f"\nProcessing {len(pending_downloads)} pending downloads...")
-                    process_downloads(pending_downloads, progress_tracker)
+                    logging.info(
+                        f"[📥] Processing {len(pending_downloads)} pending downloads..."
+                    )
+                    self.download_manager.process_downloads(
+                        pending_downloads, progress_tracker
+                    )
             except Exception as e:
-                print(f"Error processing pending downloads: {e}")
+                logging.error(f"[✗] Error processing pending downloads: {e}")
 
         except Exception as e:
-            print(f"Fatal error in URL collection process: {e}")
-            progress_tracker.close()
+            logging.error(f"[✗] Fatal error in URL collection process: {e}")
+            if not self.exit_handler.exit_requested:
+                progress_tracker.close()
 
     def get_failed_urls(self, progress_tracker):
         """Get URLs that failed during collection"""
@@ -492,10 +528,10 @@ class UrlCollector:
             # Check for failed URLs
             failed_urls = self.get_failed_urls(progress_tracker)
             if not failed_urls:
-                print("\nNo failed URLs to retry")
+                logging.info("No failed URLs to retry")
                 break
 
-            print(f"\nFound {len(failed_urls)} failed URLs")
+            logging.info(f"Found {len(failed_urls)} failed URLs")
             retry = input("Retry failed URLs? (y/n): ")
             if retry.lower() != "y":
                 break
@@ -504,7 +540,7 @@ class UrlCollector:
             retry_processor = BatchProcessor()
             retry_processor.urls = failed_urls
 
-            print("\nRetrying failed URLs...")
+            logging.info("Retrying failed URLs...")
             # Keep track of original progress data
             df = pd.read_csv(progress_tracker.progress_file)
 
@@ -524,4 +560,4 @@ class UrlCollector:
             # Save updated progress
             df.to_csv(progress_tracker.progress_file, index=False)
 
-            print("\nProgress file updated with retry results")
+            logging.info("Progress file updated with retry results")

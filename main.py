@@ -5,15 +5,18 @@ from utils.login import (
     google_login,
     load_cookies,
     save_cookies,
+    verify_login,
 )
 from utils.url_collector import UrlCollector
 from utils.progress import ProgressTracker
-from utils.download import process_downloads
+from utils.download import DownloadManager
 from utils.batch_processor import BatchProcessor
 import pandas as pd
 import argparse
 from playwright.sync_api import sync_playwright  # type: ignore
-from utils.signal_handler import GracefulExitHandler
+from utils.signal_handler import ExitHandler
+import logging
+from utils.setup_logging import Logger
 
 
 class ThreadSafeCollector:
@@ -29,22 +32,38 @@ class ThreadSafeCollector:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Law data crawler with configurable browser mode"
+        description="Law data crawler with configurable modes"
     )
     parser.add_argument(
         "--no-headless",
         action="store_true",
         help="Run browser in visible mode (default: headless)",
     )
+    parser.add_argument(
+        "--collect-only",
+        action="store_true",
+        help="Only collect URLs without downloading",
+    )
+    parser.add_argument(
+        "--download-only",
+        action="store_true",
+        help="Only process pending downloads without collecting",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=120,
+        help="Page load timeout in seconds (default: 120)",
+    )
     return parser.parse_args()
 
 
-def verify_and_setup_login(headless=True):
+def first_setup(headless=True):
     """Setup initial login and save cookies if needed"""
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(
-            headless=headless,
-            args=[
+    try:
+        with sync_playwright() as playwright:
+            # Browser arguments
+            browser_args = [
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",
                 "--no-sandbox",
@@ -53,83 +72,213 @@ def verify_and_setup_login(headless=True):
                 "--disable-extensions",
                 "--window-size=1920,1080",
                 "--start-maximized",
-            ],
-        )
-        context = browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            locale="en-US",
-            timezone_id="Asia/Ho_Chi_Minh",
-        )
+                "--disable-gpu",
+                "--disable-software-rasterizer",
+                "--disable-web-security",
+                "--allow-running-insecure-content",
+            ]
 
-        # Check if we have valid cookies
-        if not load_cookies(context):
-            print("\nNo valid cookies found. Performing initial login...")
-            page = context.new_page()
+            logging.info(
+                f"[🌐] Starting browser in {'headless' if headless else 'visible'} mode"
+            )
+
+            browser = playwright.chromium.launch(
+                headless=headless,
+                args=browser_args,
+                slow_mo=100 if not headless else 0,
+            )
+
+            context = browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+                timezone_id="Asia/Ho_Chi_Minh",
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121.0.0.0 Safari/537.36",
+                permissions=["geolocation"],
+                ignore_https_errors=True,
+                java_script_enabled=True,
+                accept_downloads=True,
+            )
+
             try:
+                # Check existing cookies
+                if load_cookies(context) and verify_login(context):
+                    logging.info("[✓] Valid cookies found, login verified")
+                    return True
+
+                logging.warning(
+                    "[⚠] No valid cookies found, starting new login process..."
+                )
+                page = context.new_page()
+
+                # Set longer timeouts
+                timeout = 120000 if not headless else 60000
+                page.set_default_timeout(timeout)
+                page.set_default_navigation_timeout(timeout)
+
                 google_email, google_password = get_credentials()
+
+                if not headless:
+                    logging.info(
+                        "[👀] Running in visible mode - please check browser window"
+                    )
+
+                page.goto("https://accounts.google.com", wait_until="networkidle")
                 google_login(page, google_email, google_password)
-                save_cookies(context)
-                print("Login successful and cookies saved")
+
+                # Save cookies only after successful login
+                if verify_login(context):
+                    save_cookies(context)
+                    logging.info("[✓] Login successful and cookies saved")
+                    return True
+
+                return False
+
+            except Exception as e:
+                logging.error(f"[✗] Login failed: {str(e)}")
+                if headless:
+                    logging.warning(
+                        "[⚠] Headless mode failed, will retry in visible mode"
+                    )
+                    return False
+                raise  # Re-raise if already in visible mode
+
             finally:
-                page.close()
-        browser.close()
+                if "page" in locals():
+                    page.close()
+                context.close()
+                browser.close()
+
+    except Exception as e:
+        logging.error(f"[✗] Setup error: {str(e)}")
+        return False
 
 
 def main():
+    # Setup logging first
+    logger = Logger()
+    logger.cleanup_old_logs()  # Clean logs older than 7 days
+    logging.info("[🚀] Starting law data crawler...")
+
+    # Parse command line arguments
     args = parse_args()
     headless = not args.no_headless
+    collect_only = args.collect_only
+    download_only = args.download_only
+
+    if collect_only and download_only:
+        logging.error("[✗] Cannot use --collect-only and --download-only together")
+        return
 
     # Initialize components
-    exit_handler = GracefulExitHandler()
+    exit_handler = ExitHandler()
     progress_tracker = ProgressTracker()
     batch_processor = BatchProcessor()
     safe_collector = ThreadSafeCollector()
     url_collector = UrlCollector()
+    download_manager = DownloadManager()
+    logging.info("[✓] Initialized components")
 
     # Register components with exit handler
     exit_handler.register_components(
-        progress_tracker=progress_tracker, url_collector=url_collector
+        progress_tracker=progress_tracker,
+        url_collector=url_collector,
+        download_manager=download_manager,
     )
 
-    # Handle login setup before starting main process
-    verify_and_setup_login(headless)
+    # Share exit handler with components that need it
+    url_collector.exit_handler = exit_handler
+    download_manager.exit_handler = exit_handler
 
-    while True:
-        print("\nStarting URL collection and download process...")
-        # First check and process existing downloads
-        if os.path.exists(progress_tracker.progress_file):
-            pending_downloads = progress_tracker.get_pending_downloads()
-            if not pending_downloads.empty:
-                print(f"\nFound {len(pending_downloads)} pending downloads")
-                process_downloads(pending_downloads, progress_tracker)
-
-        print("\nProcessing URLs...")
-        # Process URLs (including retries for failed ones)
+    # Only perform login if we need to collect URLs
+    if not download_only:
         try:
-            url_collector.process_all_urls(
-                batch_processor, safe_collector, headless, progress_tracker
-            )
+            login_success = first_setup(headless)
+            if not login_success:
+                if headless:
+                    logging.warning("[⚠] Retrying in visible mode...")
+                    headless = False
+                    login_success = first_setup(headless)
+                    if not login_success:
+                        logging.error("[✗] Setup failed in visible mode, exiting...")
+                        return
+                else:
+                    logging.error("[✗] Setup failed, exiting...")
+                    return
         except Exception as e:
-            print(f"\nError during URL processing: {str(e)}")
+            logging.error(f"[✗] Fatal setup error: {str(e)}")
+            return
 
-        # Check final status
-        df = pd.read_csv(progress_tracker.progress_file)
-        failed_urls = len(df[df["url_status"] == progress_tracker.URL_STATUS_FAILED])
-        pending_downloads = len(progress_tracker.get_pending_downloads())
+        logging.info(f"[🌐] Running in {'headless' if headless else 'visible'} mode")
 
-        print("\nFinal Status:")
-        print(f"Failed URLs: {failed_urls}")
-        print(f"Pending Downloads: {pending_downloads}")
+    try:
+        # URL Collection Phase
+        if not download_only:
+            logging.info("[🔍] Starting URL collection...")
+            try:
+                url_collector.process_all_urls(
+                    batch_processor, safe_collector, headless, progress_tracker
+                )
+            except Exception as e:
+                logging.error(f"[✗] Error during URL processing: {str(e)}")
+                if not collect_only:  # Continue to downloads if not collect-only
+                    logging.warning(
+                        "[⚠] Continuing to download phase despite collection errors"
+                    )
+                else:
+                    raise
 
-        print("\nURLs processed and downloads completed!")
+        # Download Phase
+        if not collect_only:
+            logging.info("[📥] Checking for pending downloads...")
+            pending_downloads = progress_tracker.get_pending_downloads()
 
-        if failed_urls == 0 and pending_downloads == 0:
-            print("\nAll URLs processed and downloads completed!")
-            break
+            if pending_downloads.empty:
+                logging.info("[✓] No pending downloads found")
+            else:
+                total_downloads = len(pending_downloads)
+                logging.info(f"[📥] Found {total_downloads} pending downloads")
+                download_manager.process_downloads(pending_downloads, progress_tracker)
 
-        retry = input("\nContinue processing? (y/n): ")
-        if retry.lower() != "y":
-            break
+        # Final Status Report
+        if os.path.exists(progress_tracker.progress_file):
+            df = pd.read_csv(progress_tracker.progress_file)
+            failed_urls = len(
+                df[df["url_status"] == progress_tracker.URL_STATUS_FAILED]
+            )
+            pending_count = len(progress_tracker.get_pending_downloads())
+
+            logging.info("\n=== Final Status ===")
+            if not download_only:
+                logging.info(
+                    f"[{'✗' if failed_urls > 0 else '✓'}] Failed URLs: {failed_urls}"
+                )
+            if not collect_only:
+                logging.info(f"[📥] Remaining Downloads: {pending_count}")
+
+            # Ask for retry only in full process mode
+            if not (collect_only or download_only) and (
+                failed_urls > 0 or pending_count > 0
+            ):
+                retry = input("\nContinue processing? (y/n): ")
+                if retry.lower() == "y":
+                    main()  # Restart the process
+                    return
+
+    except KeyboardInterrupt:
+        logging.info("\n[⚠] Process interrupted by user")
+        if "exit_handler" in locals():
+            exit_handler.cleanup()
+
+    except Exception as e:
+        logging.error(f"[✗] Fatal error: {str(e)}")
+        if "exit_handler" in locals():
+            exit_handler.cleanup()
+
+    finally:
+        logging.info("[✓] Crawler finished")
+        # Final terminal restoration attempt
+        if "exit_handler" in locals():
+            exit_handler.restore_terminal()
 
 
 if __name__ == "__main__":
