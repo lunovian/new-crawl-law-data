@@ -1,150 +1,191 @@
-import csv
 import os
-from datetime import datetime
+import csv
 import pandas as pd
-from tqdm.asyncio import tqdm
-import shutil
-from pathlib import Path
+import logging
 
 
 class ProgressTracker:
-    def __init__(self, progress_file="progress.csv"):
+    # Add status constants
+    URL_STATUS_PENDING = "PENDING"
+    URL_STATUS_FOUND = "FOUND"
+    URL_STATUS_FAILED = "FAILED"
+    URL_STATUS_SKIPPED = "SKIPPED"
+
+    DOWNLOAD_STATUS_NOT_STARTED = "NOT_STARTED"
+    DOWNLOAD_STATUS_DONE = "DONE"
+    DOWNLOAD_STATUS_FAILED = "FAILED"
+
+    def __init__(self, progress_file="./download_urls.csv"):
         self.progress_file = progress_file
-        self.processed_urls = self._load_processed_urls()
-        self.pbar = None
+        self.total_urls = 0
 
-    def _migrate_old_progress_file(self):
-        """Migrate old format progress file to new format"""
-        try:
-            # Create backup of old file
-            backup_file = self.progress_file + ".backup"
-            shutil.copy2(self.progress_file, backup_file)
-            print(f"Created backup of old progress file at: {backup_file}")
+        self.progress_threshold = 100
+        self.processed_count = 0
 
-            # Read old file
-            df = pd.read_csv(self.progress_file)
+        self._init_file()
 
-            # Create new file with correct format
-            self._create_progress_file()
-
-            # Migrate old data
-            with open(self.progress_file, "a", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                for _, row in df.iterrows():
-                    writer.writerow(
-                        [
-                            row.get("timestamp", ""),
-                            row.get("url", ""),
-                            "",  # doc_url
-                            "",  # pdf_url
-                            row.get("status", ""),
-                            row.get("file_types", ""),
-                            row.get("error", ""),
-                        ]
-                    )
-
-            print("Successfully migrated progress file to new format")
-            return True
-        except Exception as e:
-            print(f"Error migrating progress file: {e}")
-            # Restore backup if exists
-            if os.path.exists(backup_file):
-                shutil.copy2(backup_file, self.progress_file)
-                print("Restored backup file")
-            return False
-
-    def _load_processed_urls(self):
-        """Load previously processed URLs from progress file"""
+    def _init_file(self):
+        """Initialize CSV file if it doesn't exist"""
         if not os.path.exists(self.progress_file):
-            self._create_progress_file()
-            return set()
+            with open(self.progress_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    [
+                        "timestamp",
+                        "page_url",
+                        "doc_url",
+                        "pdf_url",
+                        "url_status",
+                        "download_status",
+                    ]
+                )
 
-        try:
+    def set_total_urls(self, total):
+        """Set total number of URLs to process"""
+        self.total_urls = total
+        print(f"\nStarting processing of {total} URLs")
+
+    def update_progress(self, url, status, doc_url="", pdf_url=""):
+        """Update progress with count and detailed information"""
+        if self.total_urls == 0:
+            return  # Prevent division by zero
+
+        self.processed_count += 1
+
+        # Always show current count with percentage
+        percentage = (self.processed_count / self.total_urls) * 100
+        print(
+            f"\rProcessed: {self.processed_count}/{self.total_urls} ({percentage:.1f}%)",
+            end="",
+        )
+
+        # Show detailed stats at threshold
+        if self.processed_count % self.progress_threshold == 0:
             df = pd.read_csv(self.progress_file)
-            return set(df[df["status"] == "SUCCESS"]["url"].tolist())
-        except pd.errors.ParserError:
-            print("Detected old progress file format, attempting migration...")
-            if self._migrate_old_progress_file():
-                # Try loading again after migration
-                df = pd.read_csv(self.progress_file)
-                return set(df[df["status"] == "SUCCESS"]["url"].tolist())
-            else:
-                print("Migration failed, creating new progress file")
-                self._create_progress_file()
-                return set()
-        except Exception as e:
-            print(f"Error loading progress file: {e}")
-            self._create_progress_file()
-            return set()
+            found = len(df[df["url_status"] == self.URL_STATUS_FOUND])
+            failed = len(df[df["url_status"] == self.URL_STATUS_FAILED])
+            skipped = len(df[df["url_status"] == self.URL_STATUS_SKIPPED])
 
-    def _create_progress_file(self):
-        """Create progress tracking CSV file with headers"""
-        with open(self.progress_file, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                [
-                    "timestamp",
-                    "url",
-                    "doc_url",
-                    "pdf_url",
-                    "status",
-                    "file_types",
-                    "error",
-                ]
-            )
+            print(f"\n{'=' * 50}")
+            print(f"Progress Update at {self.processed_count} URLs:")
+            print(f"Last URL: {url}")
+            print(f"Status: {status}")
+            if found > 0:
+                print(f"Found: {found} ({found / self.processed_count * 100:.1f}%)")
+            if failed > 0:
+                print(f"Failed: {failed} ({failed / self.processed_count * 100:.1f}%)")
+            if skipped > 0:
+                print(
+                    f"Skipped: {skipped} ({skipped / self.processed_count * 100:.1f}%)"
+                )
+            print(f"{'=' * 50}\n")
 
-    def is_url_processed(self, url):
-        """Check if URL has been successfully processed"""
-        return url in self.processed_urls
+    def process_folder(self, folder_path):
+        """Process all Excel files in the folder and return unique URLs"""
+        all_urls = []
+
+        # Create folder if it doesn't exist
+        os.makedirs(folder_path, exist_ok=True)
+
+        # Get all Excel files in the folder
+        excel_files = [
+            f for f in os.listdir(folder_path) if f.endswith((".xlsx", ".xls"))
+        ]
+
+        if not excel_files:
+            print(f"No Excel files found in {folder_path}")
+            return []
+
+        # Process each Excel file
+        for excel_file in excel_files:
+            file_path = os.path.join(folder_path, excel_file)
+            try:
+                df = pd.read_excel(file_path)
+                if "URL" in df.columns:  # Adjust column name if needed
+                    urls = df["URL"].dropna().tolist()
+                    all_urls.extend(urls)
+            except Exception as e:
+                print(f"Error processing {excel_file}: {e}")
+                continue
+
+        # Return unique URLs
+        return list(set(all_urls))
 
     def filter_unprocessed_urls(self, urls):
         """Filter out already processed URLs"""
-        return [url for url in urls if not self.is_url_processed(url)]
+        if not os.path.exists(self.progress_file):
+            return urls
 
-    def init_progress_bar(self, total):
-        """Initialize progress bar"""
-        self.pbar = tqdm(
-            total=total, desc="Processing URLs", unit="url", dynamic_ncols=True
-        )
+        # Read processed URLs from CSV
+        df = pd.read_csv(self.progress_file)
+        processed_urls = set(df["page_url"].values)
 
-    def update_progress(
-        self, url, status, file_types=None, error=None, static_urls=None
-    ):
-        """Update progress in CSV and progress bar with separate static URLs"""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Filter out processed URLs
+        unprocessed_urls = [url for url in urls if url not in processed_urls]
 
-        # Separate DOC and PDF URLs
-        doc_url = ""
-        pdf_url = ""
-        if static_urls:
-            for static_url in static_urls:
-                if static_url.lower().endswith(".pdf"):
-                    pdf_url = static_url
+        print(f"Total URLs: {len(urls)}")
+        print(f"Already processed: {len(processed_urls)}")
+        print(f"New URLs to process: {len(unprocessed_urls)}")
+
+        return unprocessed_urls
+
+    def get_pending_downloads(self):
+        """Get URLs that need to be downloaded
+
+        Returns:
+            pandas.DataFrame: DataFrame with pending downloads
+        """
+        if os.path.exists(self.progress_file):
+            df = pd.read_csv(self.progress_file)
+            pending = []
+
+            # Filter for FOUND status URLs
+            found_urls = df[
+                (df["url_status"] == self.URL_STATUS_FOUND)
+                & (df["download_status"] == self.DOWNLOAD_STATUS_NOT_STARTED)
+            ]
+
+            for _, row in found_urls.iterrows():
+                # Check and add doc URL if exists
+                if pd.notna(row["doc_url"]):
+                    pending.append(
+                        {
+                            "page_url": row["page_url"],
+                            "url": row["doc_url"],
+                            "type": "doc",
+                        }
+                    )
+
+                # Check and add pdf URL if exists
+                if pd.notna(row["pdf_url"]):
+                    pending.append(
+                        {
+                            "page_url": row["page_url"],
+                            "url": row["pdf_url"],
+                            "type": "pdf",
+                        }
+                    )
+
+            return pd.DataFrame(pending)
+        return pd.DataFrame(columns=["page_url", "url", "type"])
+
+    def update_download_status(self, page_url, status):
+        """Update download status for a given URL"""
+        try:
+            if os.path.exists(self.progress_file):
+                # Read CSV with string dtypes
+                df = pd.read_csv(self.progress_file, dtype=str)
+
+                # Ensure exact string matching
+                mask = df["page_url"].astype(str) == str(page_url)
+
+                if any(mask):
+                    df.loc[mask, "download_status"] = status
+                    df.to_csv(self.progress_file, index=False)
+                    print(f"\nUpdated download status for {page_url} to {status}")
                 else:
-                    doc_url = static_url
+                    print(f"\nWarning: URL not found: {page_url}")
 
-        with open(self.progress_file, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                [
-                    timestamp,
-                    url,
-                    doc_url,
-                    pdf_url,
-                    status,
-                    ",".join(file_types) if file_types else "",
-                    str(error) if error else "",
-                ]
-            )
-
-        if status == "SUCCESS":
-            self.processed_urls.add(url)
-
-        if self.pbar:
-            self.pbar.update(1)
-            self.pbar.set_postfix_str(f"Last: {status}")
-
-    def close(self):
-        """Close progress bar"""
-        if self.pbar:
-            self.pbar.close()
+        except Exception as e:
+            print(f"Error updating download status: {e}")
+            logging.error(f"Failed to update download status for {page_url}: {e}")

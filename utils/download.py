@@ -2,250 +2,160 @@
 import os
 import pandas as pd
 from utils.rename_file import rename_downloaded_file
-import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import cpu_count
 import requests
+from tqdm import tqdm
 
-# Remove the status_lock and save_download_status function as they're replaced by ProgressTracker
+
+# Download threads (can be more aggressive)
+download_threads = min(cpu_count() * 2, 8)  # Cap at 8
+download_threads = max(4, download_threads)  # Minimum 4
 
 
-def process_excel_file(file_path, saved_urls):
-    """
-    Process an Excel file containing URLs and add them to saved_urls list.
-    Returns True if successful, False otherwise.
-    """
+def download_file(url, filepath):
+    """Download file directly from URL with proper directory handling"""
     try:
-        # Read the Excel file into a DataFrame
-        df = pd.read_excel(file_path)
+        # Normalize filepath and ensure it has a filename
+        filepath = os.path.normpath(filepath)
+        if filepath.endswith(os.path.sep) or os.path.isdir(filepath):
+            filename = os.path.basename(url)
+            if not filename:  # If URL doesn't have a filename
+                filename = "download"  # Default name
+            filepath = os.path.join(filepath, filename)
 
-        # Check if the required columns exist
-        if "Url" not in df.columns:
-            print(f"Error: File {file_path} does not contain the 'Url' column.")
-            return False
-
-        # Extract the 'Url' column and add it to the global list
-        urls = df["Url"].dropna().tolist()  # Drop any NaN values
-
-        # Check for duplicate URLs
-        new_urls = [url for url in urls if url not in saved_urls]
-        duplicates = len(urls) - len(new_urls)
-
-        # Add new URLs to the list
-        saved_urls.extend(new_urls)
-
-        print(f"Processed {file_path}:")
-        print(f"- Found {len(urls)} total URLs")
-        print(f"- {len(new_urls)} new URLs added")
-        if duplicates > 0:
-            print(f"- {duplicates} duplicate URLs skipped")
-
-        return True
-
-    except pd.errors.EmptyDataError:
-        print(f"Error: File {file_path} is empty")
-        return False
-    except Exception as e:
-        print(f"Error processing {file_path}: {str(e)}")
-        return False
-
-
-# Function to process each URL after login
-async def retry_goto(page, url, max_retries=3, timeout=60000):
-    """Enhanced retry navigation with better error handling"""
-    for attempt in range(max_retries):
-        try:
-            print(f"\nNavigating to {url} (Attempt {attempt + 1}/{max_retries})")
-
-            # Clear navigation state
-            await page.context.clear_cookies()
+        # Create directory with proper permissions
+        directory = os.path.dirname(filepath)
+        if directory:
             try:
-                await page.reload(timeout=5000)  # Quick reload to clear state
-            except Exception as e:
-                print(f"Reload failed: {e}")
-                pass
-
-            # First try: Basic navigation
-            try:
-                response = await page.goto(
-                    url,
-                    timeout=timeout,
-                    wait_until="domcontentloaded",
-                    referer="https://luatvietnam.vn",
-                )
-
-                if not response:
-                    raise Exception("No response received")
-
-                if response.status >= 400:
-                    raise Exception(f"HTTP {response.status} error")
-
-                # Verify we're on the correct page
-                current_url = page.url
-                if not current_url or "luatvietnam.vn" not in current_url:
-                    raise Exception("Navigation redirected to wrong domain")
-
-                # Wait for essential content
-                try:
-                    await page.wait_for_selector("div#divCenter", timeout=10000)
-                except:
-                    print("Warning: Content area not found")
-
-                # Try to ensure page is fully loaded
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=5000)
-                except:
-                    print("Warning: Network not fully idle")
-
-                print(f"Successfully loaded page: {current_url}")
-                return True
-
-            except Exception as e:
-                print(f"First navigation attempt failed: {e}")
-
-                # Second try: More aggressive approach
-                await page.goto(
-                    url,
-                    timeout=timeout,
-                    wait_until="commit",  # Less strict wait condition
-                )
-
-                # Manual checks
-                await page.wait_for_timeout(2000)
-                content = await page.content()
-                if "luatvietnam.vn" not in content:
-                    raise Exception("Page content verification failed")
-
-        except Exception as e:
-            wait_time = (2**attempt) * 2000  # Longer waits between retries
-            print(f"Navigation attempt {attempt + 1} failed: {str(e)}")
-            print(f"Waiting {wait_time / 1000} seconds before retry...")
-
-            # Take screenshot for debugging
-            try:
-                await page.screenshot(path=f"nav_error_{attempt}.png")
-            except:
-                pass
-
-            await asyncio.sleep(wait_time / 1000)
-
-            if attempt == max_retries - 1:
-                print("All navigation attempts failed")
+                # Create directory with full permissions
+                os.makedirs(directory, mode=0o777, exist_ok=True)
+                # Ensure write permissions on Windows
+                os.chmod(directory, 0o777)
+            except PermissionError:
+                print(f"Permission denied creating directory: {directory}")
+                print("Try running VS Code as administrator")
                 return False
 
-    return False
-
-
-async def wait_for_download_elements(page):
-    """Wait for download elements with multiple strategies"""
-    try:
-        # First try waiting for elements to be present in DOM
-        await page.wait_for_selector(
-            "div.list-download, img.ic-download-vb",
-            state="attached",  # Changed from 'visible' to 'attached'
-            timeout=5000,
-        )
-
-        # Then ensure the content is loaded
-        await page.wait_for_function(
-            """() => {
-                const elements = document.querySelectorAll('div.list-download, img.ic-download-vb');
-                return Array.from(elements).some(el => 
-                    window.getComputedStyle(el).display !== 'none' && 
-                    window.getComputedStyle(el).visibility !== 'hidden'
-                );
-            }""",
-            timeout=5000,
-        )
-    except Exception as e:
-        print(f"Warning: Download elements detection warning: {e}")
-        # Don't raise the exception, continue anyway
-
-
-async def find_static_download_urls(page):
-    """Extract static download URLs from the page"""
-    try:
-        static_urls = await page.evaluate("""() => {
-            return Array.from(document.querySelectorAll('a[href*="static.luatvietnam.vn"]'))
-                .map(a => a.href)
-                .filter(href => href.endsWith('.pdf') || href.endsWith('.doc') || href.endsWith('.docx'));
-        }""")
-
-        if static_urls:
-            print("\nFound static download URLs:")
-            for url in static_urls:
-                print(f"- {url}")
-            return static_urls
-
-        return []
-    except Exception as e:
-        print(f"Error finding static URLs: {e}")
-        return []
-
-
-async def download_file(url, filepath, cookies):
-    """Download file directly from static URL"""
-    try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/119.0.0.0 Safari/537.36",
-            "Referer": "https://luatvietnam.vn",
         }
 
-        response = requests.get(url, cookies=cookies, headers=headers, stream=True)
+        # Download file
+        response = requests.get(url, headers=headers, stream=True)
         if response.status_code == 200:
-            with open(filepath, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-            return True
+            total_size = int(response.headers.get("content-length", 0))
+
+            try:
+                # Ensure file path is writable
+                with open(filepath, "wb") as test_file:
+                    pass
+                os.remove(filepath)  # Remove test file
+
+                with tqdm(
+                    total=total_size,
+                    unit="B",
+                    unit_scale=True,
+                    desc=os.path.basename(filepath),
+                ) as pbar:
+                    with open(filepath, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                                pbar.update(len(chunk))
+                return True
+
+            except PermissionError as pe:
+                print(f"Permission denied writing file: {filepath}")
+                print("Error details:", str(pe))
+                print("Try running VS Code as administrator")
+                return False
+            except OSError as ose:
+                print(f"OS error writing file: {filepath}")
+                print("Error details:", str(ose))
+                return False
+
         else:
             print(f"Download failed with status code: {response.status_code}")
             return False
+
     except Exception as e:
-        print(f"Download error: {e}")
+        print(f"Download error: {str(e)}")
         return False
 
 
-async def process_url(page, url, progress_tracker):
-    try:
-        print(f"\nProcessing URL: {url}")
-        await page.goto(url, wait_until="domcontentloaded")
+def download_file_worker(args):
+    """Worker function for threaded downloads"""
+    static_url, filepath, file_type = args
 
-        # Get static download URLs
-        static_urls = await find_static_download_urls(page)
-        if not static_urls:
-            raise Exception("No static download URLs found")
+    # Create directory if it doesn't exist
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
-        # Get cookies for download
-        cookies = {
-            cookie["name"]: cookie["value"] for cookie in await page.context.cookies()
-        }
+    # Skip if file exists and is valid
+    if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+        print(f"\nSkipping existing file: {os.path.basename(filepath)}")
+        return file_type
 
-        # Download files
-        downloads_dir = "./downloads"
-        downloaded_files = []
+    print(f"\nDownloading {file_type.upper()}: {static_url}")
+    if download_file(static_url, filepath):
+        print(f"Successfully downloaded: {os.path.basename(filepath)}")
+        return file_type
 
-        for static_url in static_urls:
-            file_type = "pdf" if static_url.lower().endswith(".pdf") else "doc"
+    return None
+
+
+def process_downloads(df, progress_tracker):
+    """Process pending downloads from DataFrame"""
+    if df.empty:
+        print("No pending downloads")
+        return
+
+    print(f"\nProcessing {len(df)} pending downloads...")
+
+    # Create base downloads directory with absolute path
+    downloads_dir = os.path.abspath("downloads")
+    os.makedirs(downloads_dir, exist_ok=True)
+
+    for _, row in df.iterrows():
+        try:
+            # Extract and validate values
+            page_url = str(row["page_url"]).strip()
+            url = str(row["url"]).strip()
+            file_type = str(row["type"]).strip()
+
+            if not all([page_url, url, file_type]):
+                print(f"Missing required data for row: {row}")
+                continue
+
+            # Create type directory
             type_dir = os.path.join(downloads_dir, file_type)
             os.makedirs(type_dir, exist_ok=True)
 
-            new_filename = rename_downloaded_file("", url, file_type)
-            filepath = os.path.join(type_dir, new_filename)
+            # Generate filename using rename_downloaded_file
+            safe_filename = rename_downloaded_file(url, page_url, file_type)
 
-            print(f"\nDownloading {file_type.upper()}: {static_url}")
-            if await download_file(static_url, filepath, cookies):
-                print(f"Successfully downloaded: {new_filename}")
-                downloaded_files.append(file_type)
+            # Create full filepath
+            filepath = os.path.join(type_dir, safe_filename)
 
-        if downloaded_files:
-            progress_tracker.update_progress(
-                url=url,
-                status="SUCCESS",
-                file_types=downloaded_files,
-                static_urls=static_urls,
-            )
-        else:
-            raise Exception("No files were downloaded successfully")
+            print(f"\nDownloading {file_type}: {url}")
+            print(f"To: {filepath}")
 
-    except Exception as e:
-        print(f"Error processing URL {url}: {e}")
-        progress_tracker.update_progress(url, "ERROR", None, str(e))
+            if download_file(url, filepath):
+                print(f"✓ Successfully downloaded: {safe_filename}")
+                progress_tracker.update_download_status(
+                    page_url, progress_tracker.DOWNLOAD_STATUS_DONE
+                )
+            else:
+                print(f"✗ Failed to download: {url}")
+                progress_tracker.update_download_status(
+                    page_url, progress_tracker.DOWNLOAD_STATUS_FAILED
+                )
+
+        except Exception as e:
+            print(f"Error processing download: {str(e)}")
+            if "page_url" in locals():
+                progress_tracker.update_download_status(
+                    page_url, progress_tracker.DOWNLOAD_STATUS_FAILED
+                )
+
+    print("\nDownload processing completed")
