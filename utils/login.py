@@ -9,62 +9,101 @@ CREDENTIALS_FILE = "credentials.json"
 
 
 # Function to log in with Google using XPath selectors
-async def google_login(page, google_email, google_password):
+def google_login(page, google_email, google_password):
     try:
-        await page.goto("https://luatvietnam.vn/")
-        await page.click('//span[contains(text(),"/ Đăng nhập")]')
+        page.goto("https://luatvietnam.vn/")
+        page.click('//span[contains(text(),"/ Đăng nhập")]')
 
-        await page.wait_for_selector(
+        page.wait_for_selector(
             '//form[@id="form0"]//a[@class="login-google social-cr google-login"]',
             timeout=20000,
         )
-        await page.click(
+        page.click(
             '//form[@id="form0"]//a[@class="login-google social-cr google-login"]'
         )
 
-        async with page.expect_popup() as popup_info:
-            popup = await popup_info.value
-            await popup.wait_for_load_state()
+        with page.expect_popup() as popup_info:
+            popup = popup_info.value
+            popup.wait_for_load_state()
 
-            await popup.wait_for_selector('//input[@id="identifierId"]', timeout=20000)
-            await popup.fill('//input[@id="identifierId"]', google_email)
-            await popup.press('//input[@id="identifierId"]', "Enter")
+            popup.wait_for_selector('//input[@id="identifierId"]', timeout=20000)
+            popup.fill('//input[@id="identifierId"]', google_email)
+            popup.press('//input[@id="identifierId"]', "Enter")
 
-            await popup.wait_for_selector('//input[@name="Passwd"]', timeout=20000)
-            await popup.fill('//input[@name="Passwd"]', google_password)
-            await popup.press('//input[@name="Passwd"]', "Enter")
+            popup.wait_for_selector('//input[@name="Passwd"]', timeout=20000)
+            popup.fill('//input[@name="Passwd"]', google_password)
+            popup.press('//input[@name="Passwd"]', "Enter")
 
         try:
-            await page.wait_for_selector(
+            page.wait_for_selector(
                 "//img[@class='avata-user']", timeout=45000, state="visible"
             )
             print("Google login successful!")
 
         except Exception as wait_error:
             print("Debug info:")
-            print(f"Current URL: {await page.url}")
-            print(f"Page title: {await page.title()}")
-            await page.screenshot(path="login_failed.png")
+            print(f"Current URL: {page.url}")
+            print(f"Page title: {page.title()}")
+            page.screenshot(path="login_failed.png")
             raise wait_error
 
     except Exception as e:
         print(f"Google login failed: {e}")
-        await page.screenshot(path="debug.png")
+        page.screenshot(path="debug.png")
         exit()
 
 
-async def save_cookies(context):
-    cookies = await context.cookies()
+def verify_login(page):
+    """
+    Verify if user is logged in by checking for user avatar
+    Returns True if logged in, False otherwise
+    """
+    try:
+        # Navigate to main page
+        page.goto("https://luatvietnam.vn/", timeout=30000)
+
+        # Try to find the user avatar which indicates successful login
+        try:
+            page.wait_for_selector(
+                "//a[@title='Trang cá nhân']", timeout=10000, state="visible"
+            )
+            print("Login verified: User is logged in")
+            return True
+
+        except Exception:
+            # Check alternative login indicators
+            try:
+                user_indicators = [
+                    "//div[contains(@title, '@')]",
+                    "//img[@class='avata-user']",
+                ]
+
+                for selector in user_indicators:
+                    if page.locator(selector).is_visible(timeout=5000):
+                        print("Login verified: User is logged in")
+                        return True
+
+            except Exception:
+                print("Login verification failed: User is not logged in")
+                return False
+
+    except Exception as e:
+        print(f"Error during login verification: {e}")
+        return False
+
+
+def save_cookies(context):
+    cookies = context.cookies()
     with open(COOKIES_FILE, "w") as f:
         json.dump({"cookies": cookies, "timestamp": datetime.now().isoformat()}, f)
     print(f"Cookies saved to: {os.path.abspath(COOKIES_FILE)}")
 
 
-async def load_cookies(context):
+def load_cookies(context):
     try:
         with open(COOKIES_FILE, "r") as f:
             data = json.load(f)
-            await context.add_cookies(data["cookies"])
+            context.add_cookies(data["cookies"])
             print("Previous session cookies loaded")
             return True
     except (FileNotFoundError, json.JSONDecodeError):
