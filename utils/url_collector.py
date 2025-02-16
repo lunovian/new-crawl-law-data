@@ -20,20 +20,6 @@ from multiprocessing import cpu_count
 import math
 
 
-# URL collection threads (more conservative)
-url_threads = min(cpu_count() - 1, 8)  # Cap at 4
-url_threads = max(2, url_threads)  # Minimum 2
-
-# Path to the "batches" folder
-links_folder = "./batches"
-
-# Initialize a list to store all URLs
-saved_urls = []
-
-# Get Google account credentials
-google_email, google_password = get_credentials()
-
-
 class UrlCollector:
     def __init__(self, urls_file="download_urls.csv"):
         self.urls_file = urls_file
@@ -45,6 +31,19 @@ class UrlCollector:
         self.download_manager = DownloadManager()
         self.progress_tracker = ProgressTracker()
         self.exit_handler = ExitHandler()
+
+        # URL collection threads (more conservative)
+        self.url_threads = min(cpu_count() - 1, 8)  # Cap at 4
+        self.url_threads = max(2, self.url_threads)  # Minimum 2
+
+        # Path to the "batches" folder
+        self.links_folder = "./batches"
+
+        # Initialize a list to store all URLs
+        self.saved_urls = []
+
+        # Get Google account credentials
+        self.google_email, self.google_password = get_credentials()
 
     def _init_file(self):
         """Initialize download_urls.csv if it doesn't exist"""
@@ -251,6 +250,11 @@ class UrlCollector:
                 ],
             )
 
+            if hasattr(self, "exit_handler"):
+                browser_pid = browser.subprocess_pid
+                self.exit_handler.register_browser_process(browser_pid)
+                logging.debug(f"[⚙] Registered collector browser PID: {browser_pid}")
+
             context = browser.new_context(
                 viewport={"width": 1920, "height": 1080},
                 locale="en-US",
@@ -375,7 +379,7 @@ class UrlCollector:
 
             # Calculate batch size and create batches
             try:
-                batch_size = math.ceil(len(unprocessed_urls) / url_threads)
+                batch_size = math.ceil(len(unprocessed_urls) / self.url_threads)
                 url_batches = [
                     unprocessed_urls[i : i + batch_size]
                     for i in range(0, len(unprocessed_urls), batch_size)
@@ -386,15 +390,15 @@ class UrlCollector:
 
             # Print thread and batch information
             logging.info(f"System CPU count: {cpu_count()}")
-            logging.info(f"Using {url_threads} threads")
+            logging.info(f"Using {self.url_threads} threads")
             logging.info(f"Batch size: {batch_size} URLs per thread")
 
             # Prepare arguments for each thread - remove headless from args
             thread_args = [
                 (
                     batch,  # urls
-                    google_email,  # email
-                    google_password,  # password
+                    self.google_email,  # email
+                    self.google_password,  # password
                     safe_collector.url_collector,  # collector_methods
                     headless,  # Add headless parameter
                 )
@@ -403,7 +407,7 @@ class UrlCollector:
 
             logging.info("Starting URL collection...")
             # Process URL batches in parallel using threads
-            with ThreadPoolExecutor(max_workers=url_threads) as executor:
+            with ThreadPoolExecutor(max_workers=self.url_threads) as executor:
                 self.exit_handler.register_executor(executor)
                 futures = []
                 thread_map = {}  # Store batch URLs for error handling

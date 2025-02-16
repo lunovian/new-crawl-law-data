@@ -1,4 +1,4 @@
-# New Crawl Law Data
+# Crawl Law Data
 
 This repository contains a web crawler for collecting legal data. Follow the setup instructions below to get started.
 
@@ -44,10 +44,23 @@ playwright install
 ## Usage
 
 1. Add Excel files containing URLs to the `batches` folder
-2. Run the crawler:
+2. Run the crawler with desired mode:
 
 ```bash
+# Full process (collect and download)
 python main.py
+
+# Collection only
+python main.py --collect-only
+
+# Download only
+python main.py --download-only
+
+# Visible mode collection
+python main.py --no-headless
+
+# Custom timeout
+python main.py --timeout 180
 ```
 
 The crawler will:
@@ -57,26 +70,46 @@ The crawler will:
 - Download documents to `downloads` folder
 - Automatically retry failed URLs
 - Handle browser sessions safely
+- Clean up resources on exit
 
 ## Configuration
 
 Configure the crawler using command line arguments:
 
 ```bash
-# Run in visible browser mode
-python main.py --no-headless
+Options:
+  --no-headless     Run browser in visible mode (default: headless)
+  --collect-only    Only collect URLs without downloading
+  --download-only   Only process pending downloads without collecting
+  --timeout SEC     Page load timeout in seconds (default: 120)
 ```
 
-Available options:
-
-- `--no-headless`: Run browser in visible mode instead of headless
+Note: `--collect-only` and `--download-only` cannot be used together.
 
 ## Output
+
+### Files
 
 - `download_urls.csv`: Tracks URL processing status
 - `downloads/doc/`: Word documents
 - `downloads/pdf/`: PDF files
-- Console progress bars and status updates
+- `logs/`: Detailed operation logs
+
+### Status Tracking
+
+- URL collection progress
+- Download status
+- Error reporting
+- Final statistics
+
+## Process Control
+
+The crawler supports graceful interruption:
+
+- Press Ctrl+C to initiate cleanup
+- Browser processes are properly terminated
+- Progress is saved
+- Terminal state is restored
 
 ## License
 
@@ -98,5 +131,17 @@ Common issues:
 - **Network errors**: Check internet connection
 - **Login issues**: Verify credentials
 - **Permission errors**: Check folder permissions
+- **Process hanging**: Use Ctrl+C to cleanly terminate
+
+## Statistics
+
+The crawler provides detailed statistics on completion:
+
+- Total URLs processed
+- Success/failure rates
+- Download completion status
+- Processing time
 
 ## Contact
+
+<nxan2911@gmail.com>

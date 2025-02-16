@@ -3,7 +3,6 @@ import os
 import logging
 import threading
 import time
-import psutil
 import ctypes
 from datetime import datetime
 import pandas as pd
@@ -18,10 +17,11 @@ class ExitHandler:
         self.url_collector = None
         self.download_manager = None
         self.exit_requested = False
-        self.exit_timeout = 30  # seconds to wait for graceful shutdown
+        self.exit_timeout = 5
         self.active_threads = set()
         self._lock = threading.Lock()
         self.executors = set()
+        self.browser_pids = set()
 
         # Register signal handlers
         signal.signal(signal.SIGINT, self._handle_exit)
@@ -37,20 +37,31 @@ class ExitHandler:
         except Exception as e:
             logging.error(f"[✗] Terminal restoration error: {str(e)}")
 
+    def register_browser_process(self, pid: int):
+        """Register a browser process ID for tracking
+
+        Args:
+            pid: Process ID of the browser to track
+        """
+        with self._lock:
+            self.browser_pids.add(pid)
+            logging.debug(f"[⚙] Registered browser PID: {pid}")
+
     def _cleanup_processes(self):
-        """Clean up browser processes"""
+        """Clean up only registered browser processes"""
         try:
-            for proc in psutil.process_iter(["pid", "name"]):
+            for pid in self.browser_pids.copy():
                 try:
-                    # Kill Chrome and Chromium processes
-                    if any(
-                        name in proc.info["name"].lower()
-                        for name in ["chrome", "chromium"]
-                    ):
-                        os.kill(proc.info["pid"], signal.SIGTERM)
-                        logging.debug(f"[✓] Terminated process: {proc.info['name']}")
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
+                    os.kill(pid, signal.SIGTERM)
+                    logging.debug(
+                        f"[✓] Terminated registered browser process (PID: {pid})"
+                    )
+                    self.browser_pids.remove(pid)
+                except ProcessLookupError:
+                    self.browser_pids.remove(pid)
+                except Exception as e:
+                    logging.error(f"[✗] Error terminating process {pid}: {str(e)}")
+
         except Exception as e:
             logging.error(f"[✗] Process cleanup error: {str(e)}")
 

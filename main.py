@@ -88,6 +88,12 @@ def first_setup(headless=True):
                 slow_mo=100 if not headless else 0,
             )
 
+            # Register browser process before creating context
+            if "exit_handler" in globals():
+                browser_pid = browser.subprocess_pid
+                exit_handler.register_browser_process(browser_pid)
+                logging.debug(f"[⚙] Registered setup browser PID: {browser_pid}")
+
             context = browser.new_context(
                 viewport={"width": 1920, "height": 1080},
                 locale="en-US",
@@ -170,6 +176,7 @@ def main():
         return
 
     # Initialize components
+    global exit_handler
     exit_handler = ExitHandler()
     progress_tracker = ProgressTracker()
     batch_processor = BatchProcessor()
