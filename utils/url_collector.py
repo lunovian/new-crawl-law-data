@@ -68,19 +68,18 @@ class UrlCollector:
             print(f"Status: {status}")
 
     def collect_urls(self, page, url):
-        """Collect document and PDF URLs from a page
-
-        Returns:
-            tuple: (doc_url, pdf_url) - Both empty strings if not found
-        """
+        """Collect document and PDF URLs from a page"""
         processed_urls = self.get_processed_urls()
-
         if url in processed_urls:
             self.progress_tracker.update_progress(url, "SKIPPED")
             return "", ""
 
         for attempt in range(self.max_retries):
             try:
+                # Set timeouts
+                page.set_default_timeout(60000)
+                page.set_default_navigation_timeout(60000)
+
                 # Block unwanted resources
                 page.route(
                     "**/*.{png,jpg,jpeg,gif,css,woff,woff2}",
@@ -88,9 +87,10 @@ class UrlCollector:
                 )
 
                 # Navigate with timeout
-                page.goto(url, wait_until="domcontentloaded", timeout=self.timeout)
+                page.goto(url, wait_until="networkidle", timeout=60000)
+                page.wait_for_load_state("networkidle", timeout=60000)
 
-                # Get page content
+                # Get page content and parse
                 html_content = page.content()
                 soup = BeautifulSoup(html_content, "html.parser")
 
@@ -107,37 +107,39 @@ class UrlCollector:
                     if static_links["doc"] and static_links["pdf"]:
                         break
 
-                # Save results
-                self.save_urls(
-                    page_url=url,
-                    doc_url=static_links["doc"],
-                    pdf_url=static_links["pdf"],
-                    url_status="FOUND"
-                    if (static_links["doc"] or static_links["pdf"])
-                    else "ERROR",  # Changed 'status' to 'url_status'
-                    download_status="NOT_STARTED",
-                )
-
-                # Update progress with results
-                status = (
+                # Save results and update progress
+                url_status = (
                     "FOUND"
                     if (static_links["doc"] or static_links["pdf"])
                     else "FAILED"
                 )
+                self.save_urls(
+                    page_url=url,
+                    doc_url=static_links["doc"],
+                    pdf_url=static_links["pdf"],
+                    url_status=url_status,
+                    download_status="NOT_STARTED",
+                )
+
                 self.progress_tracker.update_progress(
                     url=url,
-                    status=status,
+                    status=url_status,
                     doc_url=static_links["doc"],
                     pdf_url=static_links["pdf"],
                 )
 
                 return static_links["doc"], static_links["pdf"]
 
-            except Exception as e:
-                logging.error(f"Error for {url}: {str(e)}")
+            except TimeoutError as te:
+                print(f"Timeout on attempt {attempt + 1} for {url}: {str(te)}")
                 if attempt == self.max_retries - 1:
-                    self.progress_tracker.update_progress(url, "FAILED")
-                return "", ""
+                    self.save_urls(page_url=url, url_status="FAILED")
+            except Exception as e:
+                print(f"Error on attempt {attempt + 1} for {url}: {str(e)}")
+                if attempt == self.max_retries - 1:
+                    self.save_urls(page_url=url, url_status="FAILED")
+
+        return "", ""
 
     def save_urls(
         self,
