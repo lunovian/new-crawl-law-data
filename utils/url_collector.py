@@ -3,14 +3,12 @@ import os
 from datetime import datetime
 from bs4 import BeautifulSoup
 import re
-from playwright.async_api import Error as PlaywrightError, TimeoutError
+from playwright.async_api import Error as TimeoutError
 from playwright.sync_api import sync_playwright  # type: ignore
 from utils.batch_processor import BatchProcessor
 from utils.download import DownloadManager
 from utils.progress import ProgressTracker
 from utils.signal_handler import ExitHandler
-from utils.download import DownloadManager
-from utils.rename_file import rename_downloaded_file
 import logging
 from utils.login import (
     get_credentials,

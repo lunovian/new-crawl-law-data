@@ -7,7 +7,6 @@ import psutil
 import ctypes
 from datetime import datetime
 import pandas as pd
-from typing import Any
 from concurrent.futures import ThreadPoolExecutor
 
 
