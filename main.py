@@ -32,12 +32,28 @@ class ThreadSafeCollector:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Law data crawler with configurable browser mode"
+        description="Law data crawler with configurable modes"
     )
     parser.add_argument(
         "--no-headless",
         action="store_true",
         help="Run browser in visible mode (default: headless)",
+    )
+    parser.add_argument(
+        "--collect-only",
+        action="store_true",
+        help="Only collect URLs without downloading",
+    )
+    parser.add_argument(
+        "--download-only",
+        action="store_true",
+        help="Only process pending downloads without collecting",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=120,
+        help="Page load timeout in seconds (default: 120)",
     )
     return parser.parse_args()
 
@@ -146,6 +162,12 @@ def main():
     # Parse command line arguments
     args = parse_args()
     headless = not args.no_headless
+    collect_only = args.collect_only
+    download_only = args.download_only
+
+    if collect_only and download_only:
+        logging.error("[✗] Cannot use --collect-only and --download-only together")
+        return
 
     # Initialize components
     exit_handler = ExitHandler()
@@ -167,65 +189,96 @@ def main():
     url_collector.exit_handler = exit_handler
     download_manager.exit_handler = exit_handler
 
-    # Improved login setup handling
-    try:
-        login_success = first_setup(headless)
-        if not login_success:
-            if headless:
-                logging.warning("[⚠] Retrying in visible mode...")
-                headless = False  # Switch to visible mode
-                login_success = first_setup(headless)
-                if not login_success:
-                    logging.error("[✗] Setup failed in visible mode, exiting...")
-                    return
-            else:
-                logging.error("[✗] Setup failed, exiting...")
-                return
-    except Exception as e:
-        logging.error(f"[✗] Fatal setup error: {str(e)}")
-        return
-
-    # Log current mode after login
-    logging.info(f"[🌐] Running in {'headless' if headless else 'visible'} mode")
-
-    while True:
-        logging.info("[⚡] Starting URL collection and download process...")
-
-        # Process URLs (including retries for failed ones)
+    # Only perform login if we need to collect URLs
+    if not download_only:
         try:
-            url_collector.process_all_urls(
-                batch_processor, safe_collector, headless, progress_tracker
-            )
+            login_success = first_setup(headless)
+            if not login_success:
+                if headless:
+                    logging.warning("[⚠] Retrying in visible mode...")
+                    headless = False
+                    login_success = first_setup(headless)
+                    if not login_success:
+                        logging.error("[✗] Setup failed in visible mode, exiting...")
+                        return
+                else:
+                    logging.error("[✗] Setup failed, exiting...")
+                    return
         except Exception as e:
-            logging.error(f"[✗] Error during URL processing: {str(e)}")
+            logging.error(f"[✗] Fatal setup error: {str(e)}")
+            return
 
-        # Check final status
-        df = pd.read_csv(progress_tracker.progress_file)
-        failed_urls = len(df[df["url_status"] == progress_tracker.URL_STATUS_FAILED])
-        pending_downloads = progress_tracker.get_pending_downloads()
+        logging.info(f"[🌐] Running in {'headless' if headless else 'visible'} mode")
 
-        if not pending_downloads.empty:
-            logging.info(
-                f"[📥] Processing {len(pending_downloads)} pending downloads..."
+    try:
+        # URL Collection Phase
+        if not download_only:
+            logging.info("[🔍] Starting URL collection...")
+            try:
+                url_collector.process_all_urls(
+                    batch_processor, safe_collector, headless, progress_tracker
+                )
+            except Exception as e:
+                logging.error(f"[✗] Error during URL processing: {str(e)}")
+                if not collect_only:  # Continue to downloads if not collect-only
+                    logging.warning(
+                        "[⚠] Continuing to download phase despite collection errors"
+                    )
+                else:
+                    raise
+
+        # Download Phase
+        if not collect_only:
+            logging.info("[📥] Checking for pending downloads...")
+            pending_downloads = progress_tracker.get_pending_downloads()
+
+            if pending_downloads.empty:
+                logging.info("[✓] No pending downloads found")
+            else:
+                total_downloads = len(pending_downloads)
+                logging.info(f"[📥] Found {total_downloads} pending downloads")
+                download_manager.process_downloads(pending_downloads, progress_tracker)
+
+        # Final Status Report
+        if os.path.exists(progress_tracker.progress_file):
+            df = pd.read_csv(progress_tracker.progress_file)
+            failed_urls = len(
+                df[df["url_status"] == progress_tracker.URL_STATUS_FAILED]
             )
-            download_manager.process_downloads(pending_downloads, progress_tracker)
+            pending_count = len(progress_tracker.get_pending_downloads())
 
-        # Show final status
-        logging.info("\n=== Final Status ===")
-        logging.info(f"[{'✗' if failed_urls > 0 else '✓'}] Failed URLs: {failed_urls}")
-        pending_count = len(progress_tracker.get_pending_downloads())
-        logging.info(f"[📥] Pending Downloads: {pending_count}")
+            logging.info("\n=== Final Status ===")
+            if not download_only:
+                logging.info(
+                    f"[{'✗' if failed_urls > 0 else '✓'}] Failed URLs: {failed_urls}"
+                )
+            if not collect_only:
+                logging.info(f"[📥] Remaining Downloads: {pending_count}")
 
-        if failed_urls == 0 and pending_count == 0:
-            logging.info("[✓] All tasks completed successfully!")
-            break
+            # Ask for retry only in full process mode
+            if not (collect_only or download_only) and (
+                failed_urls > 0 or pending_count > 0
+            ):
+                retry = input("\nContinue processing? (y/n): ")
+                if retry.lower() == "y":
+                    main()  # Restart the process
+                    return
 
-        retry = input("\nContinue processing? (y/n): ")
-        if retry.lower() != "y":
-            logging.info("[👋] Process terminated by user")
-            break
+    except KeyboardInterrupt:
+        logging.info("\n[⚠] Process interrupted by user")
+        if "exit_handler" in locals():
+            exit_handler.cleanup()
 
-    logging.info("[✓] Crawler finished")
+    except Exception as e:
+        logging.error(f"[✗] Fatal error: {str(e)}")
+        if "exit_handler" in locals():
+            exit_handler.cleanup()
+
+    finally:
+        logging.info("[✓] Crawler finished")
+        # Final terminal restoration attempt
+        if "exit_handler" in locals():
+            exit_handler.restore_terminal()
 
 
 if __name__ == "__main__":

@@ -4,3 +4,4 @@ pandas
 tqdm
 beautifulsoup4
 aiohttp
+psutil
