@@ -43,7 +43,7 @@ class ProgressTracker:
     def set_total_urls(self, total):
         """Set total number of URLs to process"""
         self.total_urls = total
-        print(f"\nStarting processing of {total} URLs")
+        logging.info(f"Starting processing of {total} URLs")
 
     def update_progress(self, url, status, doc_url="", pdf_url=""):
         """Update progress with count and detailed information"""
@@ -54,9 +54,8 @@ class ProgressTracker:
 
         # Always show current count with percentage
         percentage = (self.processed_count / self.total_urls) * 100
-        print(
-            f"\rProcessed: {self.processed_count}/{self.total_urls} ({percentage:.1f}%)",
-            end="",
+        logging.info(
+            f"Processed: {self.processed_count}/{self.total_urls} ({percentage:.1f}%)"
         )
 
         # Show detailed stats at threshold
@@ -66,19 +65,22 @@ class ProgressTracker:
             failed = len(df[df["url_status"] == self.URL_STATUS_FAILED])
             skipped = len(df[df["url_status"] == self.URL_STATUS_SKIPPED])
 
-            print(f"\n{'=' * 50}")
-            print(f"Progress Update at {self.processed_count} URLs:")
-            print(f"Last URL: {url}")
-            print(f"Status: {status}")
+            logging.info("=" * 50)
+            logging.info(f"Progress Update at {self.processed_count} URLs:")
+            logging.info(f"Last URL: {url}")
+            logging.info(f"Status: {status}")
             if found > 0:
-                print(f"Found: {found} ({found / self.processed_count * 100:.1f}%)")
+                logging.info(
+                    f"Found: {found} ({found / self.processed_count * 100:.1f}%)"
+                )
             if failed > 0:
-                print(f"Failed: {failed} ({failed / self.processed_count * 100:.1f}%)")
+                logging.info(
+                    f"Failed: {failed} ({failed / self.processed_count * 100:.1f}%)"
+                )
             if skipped > 0:
-                print(
+                logging.info(
                     f"Skipped: {skipped} ({skipped / self.processed_count * 100:.1f}%)"
                 )
-            print(f"{'=' * 50}\n")
 
     def process_folder(self, folder_path):
         """Process all Excel files in the folder and return unique URLs"""
@@ -93,7 +95,7 @@ class ProgressTracker:
         ]
 
         if not excel_files:
-            print(f"No Excel files found in {folder_path}")
+            logging.info(f"No Excel files found in {folder_path}")
             return []
 
         # Process each Excel file
@@ -105,7 +107,7 @@ class ProgressTracker:
                     urls = df["URL"].dropna().tolist()
                     all_urls.extend(urls)
             except Exception as e:
-                print(f"Error processing {excel_file}: {e}")
+                logging.error(f"Error processing {excel_file}: {e}")
                 continue
 
         # Return unique URLs
@@ -123,9 +125,9 @@ class ProgressTracker:
         # Filter out processed URLs
         unprocessed_urls = [url for url in urls if url not in processed_urls]
 
-        print(f"Total URLs: {len(urls)}")
-        print(f"Already processed: {len(processed_urls)}")
-        print(f"New URLs to process: {len(unprocessed_urls)}")
+        logging.info(f"Total URLs: {len(urls)}")
+        logging.info(f"Already processed: {len(processed_urls)}")
+        logging.info(f"New URLs to process: {len(unprocessed_urls)}")
 
         return unprocessed_urls
 
@@ -182,10 +184,10 @@ class ProgressTracker:
                 if any(mask):
                     df.loc[mask, "download_status"] = status
                     df.to_csv(self.progress_file, index=False)
-                    print(f"\nUpdated download status for {page_url} to {status}")
+                    logging.info(f"Updated download status for {page_url} to {status}")
                 else:
-                    print(f"\nWarning: URL not found: {page_url}")
+                    logging.warning(f"URL not found: {page_url}")
 
         except Exception as e:
-            print(f"Error updating download status: {e}")
+            logging.error(f"Error updating download status: {e}")
             logging.error(f"Failed to update download status for {page_url}: {e}")

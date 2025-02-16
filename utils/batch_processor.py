@@ -1,6 +1,7 @@
 import os
 import pandas as pd
 from .progress import ProgressTracker
+import logging
 
 
 class BatchProcessor:
@@ -14,9 +15,11 @@ class BatchProcessor:
             df = pd.read_excel(file_path)
             urls = df["Url"].tolist()
             self.saved_urls.extend(urls)
-            print(f"Processed {len(urls)} URLs from {os.path.basename(file_path)}")
+            logging.info(
+                f"Processed {len(urls)} URLs from {os.path.basename(file_path)}"
+            )
         except Exception as e:
-            print(f"Error processing {file_path}: {e}")
+            logging.error(f"Error processing {file_path}: {e}")
 
     def process_folder(self, folder_path):
         """Process all Excel files in the specified folder"""
