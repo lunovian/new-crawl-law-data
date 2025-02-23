@@ -12,3 +12,4 @@ collection_progress.json
 *.log
 download_urls.csv
 download_urls copy.csv
+/logs

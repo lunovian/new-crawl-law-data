@@ -250,10 +250,19 @@ class UrlCollector:
                 ],
             )
 
-            if hasattr(self, "exit_handler"):
-                browser_pid = browser.subprocess_pid
-                self.exit_handler.register_browser_process(browser_pid)
-                logging.debug(f"[⚙] Registered collector browser PID: {browser_pid}")
+            # Updated browser PID access
+            try:
+                pid = None
+                if hasattr(browser, "process"):
+                    pid = browser.process.pid
+                elif hasattr(browser, "_pid"):
+                    pid = browser._pid
+
+                if pid and hasattr(self, "exit_handler"):
+                    self.exit_handler.register_browser_process(pid)
+                    logging.debug(f"[⚙] Registered collector browser PID: {pid}")
+            except Exception as e:
+                logging.warning(f"[⚠] Could not register browser PID: {e}")
 
             context = browser.new_context(
                 viewport={"width": 1920, "height": 1080},
@@ -518,48 +527,85 @@ class UrlCollector:
         ].tolist()
 
     def process_all_urls(
-        self, batch_processor, safe_collector, headless, progress_tracker
+        self,
+        batch_processor,
+        safe_collector,
+        headless,
+        progress_tracker,
+        validate_fn=None,
     ):
-        """Process all URLs including retries for failed ones"""
-        while True:
-            # Process URLs
-            self.process_url_collection(
-                batch_processor, safe_collector, headless, progress_tracker
-            )
+        """Process all URLs including retries for failed ones
 
-            # Check for failed URLs
-            failed_urls = self.get_failed_urls(progress_tracker)
-            if not failed_urls:
-                logging.info("No failed URLs to retry")
-                break
+        Args:
+            batch_processor: BatchProcessor instance for getting URLs
+            safe_collector: ThreadSafeCollector instance
+            headless: Boolean for browser mode
+            progress_tracker: ProgressTracker instance
+            validate_fn: Optional function to validate URLs DataFrame
+        """
+        try:
+            # Get and validate URLs if function provided
+            if validate_fn:
+                urls_df = batch_processor.get_urls()
+                batch_processor.urls = validate_fn(urls_df)
+                logging.info("[✓] URLs validated")
 
-            logging.info(f"Found {len(failed_urls)} failed URLs")
-            retry = input("Retry failed URLs? (y/n): ")
-            if retry.lower() != "y":
-                break
+            while True:
+                # Process URLs
+                self.process_url_collection(
+                    batch_processor, safe_collector, headless, progress_tracker
+                )
 
-            # Create new batch processor with failed URLs
-            retry_processor = BatchProcessor()
-            retry_processor.urls = failed_urls
+                # Check for failed URLs
+                failed_urls = self.get_failed_urls(progress_tracker)
+                if not failed_urls:
+                    logging.info("[✓] No failed URLs to retry")
+                    break
 
-            logging.info("Retrying failed URLs...")
-            # Keep track of original progress data
-            df = pd.read_csv(progress_tracker.progress_file)
+                logging.info(f"[⚠] Found {len(failed_urls)} failed URLs")
 
-            # Process failed URLs
-            self.process_url_collection(
-                retry_processor, safe_collector, headless, progress_tracker
-            )
+                # In headless mode, automatically retry
+                if headless:
+                    retry = "y"
+                    logging.info("[🔄] Auto-retrying failed URLs in headless mode")
+                else:
+                    retry = input("\nRetry failed URLs? (y/n): ")
 
-            # Update progress file - replace old failed entries with new results
-            new_df = pd.read_csv(progress_tracker.progress_file)
-            for url in failed_urls:
-                # Get new result for the URL
-                new_result = new_df[new_df["page_url"] == url].iloc[0]
-                # Update original dataframe with new result
-                df.loc[df["page_url"] == url] = new_result
+                if retry.lower() != "y":
+                    logging.info("[✓] Skipping retry of failed URLs")
+                    break
 
-            # Save updated progress
-            df.to_csv(progress_tracker.progress_file, index=False)
+                # Create new batch processor with failed URLs
+                retry_processor = BatchProcessor()
+                retry_processor.urls = failed_urls
 
-            logging.info("Progress file updated with retry results")
+                logging.info("[🔄] Retrying failed URLs...")
+
+                # Keep track of original progress data
+                df = pd.read_csv(progress_tracker.progress_file)
+
+                # Process failed URLs
+                self.process_url_collection(
+                    retry_processor, safe_collector, headless, progress_tracker
+                )
+
+                try:
+                    # Update progress file - replace old failed entries with new results
+                    new_df = pd.read_csv(progress_tracker.progress_file)
+                    for url in failed_urls:
+                        # Get new result for the URL
+                        new_result = new_df[new_df["page_url"] == url].iloc[0]
+                        # Update original dataframe with new result
+                        df.loc[df["page_url"] == url] = new_result
+
+                    # Save updated progress
+                    df.to_csv(progress_tracker.progress_file, index=False)
+                    logging.info("[✓] Progress file updated with retry results")
+
+                except Exception as e:
+                    logging.error(f"[✗] Error updating progress file: {str(e)}")
+                    raise
+
+        except Exception as e:
+            logging.error(f"[✗] Error in process_all_urls: {str(e)}")
+            raise

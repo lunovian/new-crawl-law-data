@@ -55,6 +55,48 @@ class DownloadManager:
             logging.error(f"[✗] Error verifying filepath: {str(e)}")
             return False, ""
 
+    def _verify_batches_dir() -> tuple[bool, str]:
+        """Verify and prepare batches directory
+
+        Returns:
+            tuple[bool, str]: (success, directory_path)
+        """
+        try:
+            batches_dir = os.path.join(os.path.dirname(__file__), "batches")
+
+            # Create directory if needed
+            if not os.path.exists(batches_dir):
+                try:
+                    os.makedirs(batches_dir, mode=0o777, exist_ok=True)
+                    os.chmod(batches_dir, 0o777)  # Windows permissions
+                    logging.info("[✓] Created batches folder")
+                    logging.warning("[⚠] Please add Excel files to the batches folder")
+                    return False, batches_dir
+                except PermissionError:
+                    logging.error("[✗] Permission denied creating batches folder")
+                    logging.error("[!] Try running with administrator privileges")
+                    return False, ""
+                except Exception as e:
+                    logging.error(f"[✗] Could not create batches folder: {str(e)}")
+                    return False, ""
+
+            # Check for Excel files
+            excel_files = [
+                f for f in os.listdir(batches_dir) if f.endswith((".xlsx", ".xls"))
+            ]
+            if not excel_files:
+                logging.error("[✗] No Excel files found in batches folder")
+                logging.info(
+                    "[ℹ] Please add Excel files containing URLs to the batches folder"
+                )
+                return False, batches_dir
+
+            return True, batches_dir
+
+        except Exception as e:
+            logging.error(f"[✗] Error checking batches folder: {str(e)}")
+            return False, ""
+
     def download_file(self, url: str, filepath: str) -> bool:
         """Download file with progress bar and proper error handling"""
         try:

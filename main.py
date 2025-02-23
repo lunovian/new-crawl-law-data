@@ -1,5 +1,6 @@
 import os
 from threading import Lock
+import traceback
 from utils.login import (
     get_credentials,
     google_login,
@@ -88,11 +89,13 @@ def first_setup(headless=True):
                 slow_mo=100 if not headless else 0,
             )
 
-            # Register browser process before creating context
-            if "exit_handler" in globals():
+            try:
                 browser_pid = browser.subprocess_pid
-                exit_handler.register_browser_process(browser_pid)
-                logging.debug(f"[⚙] Registered setup browser PID: {browser_pid}")
+                if browser_pid and "exit_handler" in globals():
+                    exit_handler.register_browser_process(browser_pid)
+                    logging.debug(f"[⚙] Registered setup browser PID: {browser_pid}")
+            except Exception as e:
+                logging.warning(f"[⚠] Could not register browser PID: {e}")
 
             context = browser.new_context(
                 viewport={"width": 1920, "height": 1080},
@@ -165,6 +168,11 @@ def main():
     logger.cleanup_old_logs()  # Clean logs older than 7 days
     logging.info("[🚀] Starting law data crawler...")
 
+    # Verify batches directory and files
+    success, batches_dir = _verify_batches_dir()
+    if not success:
+        return
+
     # Parse command line arguments
     args = parse_args()
     headless = not args.no_headless
@@ -175,29 +183,35 @@ def main():
         logging.error("[✗] Cannot use --collect-only and --download-only together")
         return
 
-    # Initialize components
-    global exit_handler
-    exit_handler = ExitHandler()
-    progress_tracker = ProgressTracker()
-    batch_processor = BatchProcessor()
-    safe_collector = ThreadSafeCollector()
-    url_collector = UrlCollector()
-    download_manager = DownloadManager()
-    logging.info("[✓] Initialized components")
+    try:
+        # Initialize components
+        global exit_handler
+        exit_handler = ExitHandler()
+        progress_tracker = ProgressTracker()
+        batch_processor = BatchProcessor()
+        safe_collector = ThreadSafeCollector()
+        url_collector = UrlCollector()
+        download_manager = DownloadManager()
+        logging.info("[✓] Initialized components")
 
-    # Register components with exit handler
-    exit_handler.register_components(
-        progress_tracker=progress_tracker,
-        url_collector=url_collector,
-        download_manager=download_manager,
-    )
+        # Register components with exit handler
+        exit_handler.register_components(
+            progress_tracker=progress_tracker,
+            url_collector=url_collector,
+            download_manager=download_manager,
+        )
 
-    # Share exit handler with components that need it
-    url_collector.exit_handler = exit_handler
-    download_manager.exit_handler = exit_handler
+        # Share exit handler with components
+        url_collector.exit_handler = exit_handler
+        download_manager.exit_handler = exit_handler
+
+    except Exception as e:
+        logging.error(f"[✗] Component initialization failed: {str(e)}")
+        return
 
     # Only perform login if we need to collect URLs
     if not download_only:
+        logging.info("[🔍] Starting URL collection...")
         try:
             login_success = first_setup(headless)
             if not login_success:
@@ -222,11 +236,39 @@ def main():
         if not download_only:
             logging.info("[🔍] Starting URL collection...")
             try:
+                # Update validate_urls function:
+                def validate_urls(urls_df):
+                    """Validate and clean URL data"""
+                    if urls_df.empty:
+                        return urls_df
+
+                    # Remove duplicates
+                    urls_df = urls_df.drop_duplicates(subset=["url"])
+
+                    # Ensure URL format
+                    urls_df["url"] = urls_df["url"].astype(str)
+                    urls_df = urls_df[
+                        urls_df["url"].str.contains("http", case=False, na=False)
+                    ]
+
+                    # Ensure single values in cells
+                    for col in urls_df.columns:
+                        urls_df[col] = urls_df[col].apply(
+                            lambda x: x[0] if isinstance(x, (list, tuple)) else x
+                        )
+                    return urls_df
+
                 url_collector.process_all_urls(
-                    batch_processor, safe_collector, headless, progress_tracker
+                    batch_processor,
+                    safe_collector,
+                    headless,
+                    progress_tracker,
+                    validate_urls,
                 )
             except Exception as e:
                 logging.error(f"[✗] Error during URL processing: {str(e)}")
+                logging.debug(f"Traceback: {traceback.format_exc()}")
+
                 if not collect_only:  # Continue to downloads if not collect-only
                     logging.warning(
                         "[⚠] Continuing to download phase despite collection errors"
@@ -268,6 +310,8 @@ def main():
             ):
                 retry = input("\nContinue processing? (y/n): ")
                 if retry.lower() == "y":
+                    if "exit_handler" in locals():
+                        exit_handler.cleanup()  # Clean up before restart
                     main()  # Restart the process
                     return
 
